@@ -42,7 +42,8 @@ armsoc_drv_la_LIBADD = @XORG_LIBS@
 armsoc_drv_ladir = @moduledir@/drivers
 DRMMODE_SRCS = drmmode_exynos/drmmode_exynos.c \
 	drmmode_pl111/drmmode_pl111.c \
-	drmmode_sun4i/drmmode_sun4i.c
+	drmmode_sun4i/drmmode_sun4i.c \
+	drmmode_meson/drmmode_meson.c
 
 
 armsoc_drv_la_SOURCES = \
