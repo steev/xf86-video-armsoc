@@ -1,31 +1,50 @@
 /*
- * Copyright (C) 2014 Endless Mobile
+ * Copyright © 2013 ARM Limited.
  *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License as
- * published by the Free Software Foundation; either version 2 of the
- * License, or (at your option) any later version.
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
  *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details.
+ * The above copyright notice and this permission notice (including the next
+ * paragraph) shall be included in all copies or substantial portions of the
+ * Software.
  *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA
- * 02111-1307, USA.
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
  *
- * Written by:
- *     Jasper St. Pierre <jstpierre@mecheye.net>
  */
+
+#include <xf86drm.h>
 
 #include "../drmmode_driver.h"
 
-#include "meson_drm.h"
-#include <errno.h>
-#include <xf86drm.h>
-#include <xf86drmMode.h>
+#define DIV_ROUND_UP(n,d) (((n) + (d) - 1) / (d))
+
+#define __ALIGN_KERNEL_MASK(x, mask)	(((x) + (mask)) & ~(mask))
+#define __ALIGN_KERNEL(x, a)		__ALIGN_KERNEL_MASK(x, (typeof(x))(a) - 1)
+#define ALIGN(x, a)			__ALIGN_KERNEL((x), (a))
+
+/* This should be included from uapi headers once the driver is
+ * mainlined
+ */
+struct drm_meson_gem_create {
+	uint64_t	size;
+	uint32_t	flags;
+	uint32_t	handle;
+};
+
+#define DRM_MESON_GEM_CREATE            0x00
+
+#define DRM_IOCTL_MESON_GEM_CREATE      DRM_IOWR(DRM_COMMAND_BASE + DRM_MESON_GEM_CREATE, \
+						 struct drm_meson_gem_create)
 
 /* Cursor dimensions
  * Technically we probably don't have any size limit.. since we
@@ -33,37 +52,34 @@
  * cursor images in the max size, so don't use width/height values
  * that are too big
  */
-#define CURSORW  (64)
-#define CURSORH  (64)
-
-#define CURSORPAD  (0)
-
-#define ALIGN(val, align)	(((val) + (align) - 1) & ~((align) - 1))
+/* width */
+#define CURSORW   (64)
+/* height */
+#define CURSORH   (64)
+/* Padding added down each side of cursor image */
+#define CURSORPAD (0)
 
 static int create_custom_gem(int fd, struct armsoc_create_gem *create_gem)
 {
-	struct drm_meson_gem_create_with_ump create_meson;
-	size_t pitch;
+	struct drm_meson_gem_create create_meson;
 	int ret;
+	unsigned int pitch;
 
 	assert((create_gem->buf_type == ARMSOC_BO_SCANOUT) ||
 	       (create_gem->buf_type == ARMSOC_BO_NON_SCANOUT));
 
 	/* make pitch a multiple of 64 bytes for best performance */
-	pitch = ALIGN(create_gem->width * ((create_gem->bpp + 7) / 8), 64);
+	pitch = DIV_ROUND_UP(create_gem->width * create_gem->bpp, 8);
+	pitch = ALIGN(pitch, 64);
+
+	memset(&create_meson, 0, sizeof(create_meson));
 	create_meson.size = create_gem->height * pitch;
-	create_meson.flags = 0;
 
-	if (create_gem->buf_type == ARMSOC_BO_SCANOUT)
-		create_meson.flags |= DRM_MESON_GEM_CREATE_WITH_UMP_FLAG_SCANOUT;
-	else
-		create_meson.flags |= DRM_MESON_GEM_CREATE_WITH_UMP_FLAG_TEXTURE;
-
-	ret = drmIoctl(fd, DRM_IOCTL_MESON_GEM_CREATE_WITH_UMP, &create_meson);
+	ret = drmIoctl(fd, DRM_IOCTL_MESON_GEM_CREATE, &create_meson);
 	if (ret)
 		return ret;
 
-	/* Convert custom meson ioctl to generic create_gem */
+	/* Convert custom create_meson to generic create_gem */
 	create_gem->handle = create_meson.handle;
 	create_gem->pitch = pitch;
 	create_gem->size = create_meson.size;
@@ -71,59 +87,14 @@ static int create_custom_gem(int fd, struct armsoc_create_gem *create_gem)
 	return 0;
 }
 
-static int cache_ops_control(int fd, enum armsoc_drm_cache_op_control op)
-{
-	struct drm_meson_cache_operations_control coc;
-	int ret;
-
-	switch (op) {
-		case ARMSOC_DRM_CACHE_OP_START:
-			coc.op = DRM_MESON_CACHE_OP_START;
-			break;
-		case ARMSOC_DRM_CACHE_OP_FINISH:
-			coc.op = DRM_MESON_CACHE_OP_FINISH;
-			break;
-		case ARMSOC_DRM_CACHE_OP_COUNT:
-			return -EINVAL;
-	}
-
-	ret = drmIoctl(fd, DRM_IOCTL_MESON_CACHE_OPERATIONS_CONTROL, &coc);
-	if (ret < 0) {
-		ErrorF("cache_operations_control ioctl failed:%s\n",
-		       strerror(errno));
-		return ret;
-	}
-
-	return 0;
-}
-
-static int gem_set_domain(int fd, struct armsoc_gem_set_domain gsd)
-{
-	struct drm_meson_gem_set_domain mgsd;
-	int ret;
-
-	mgsd.handle = gsd.handle;
-	mgsd.write_domain = gsd.write_domain;
-	ret = drmIoctl(fd, DRM_IOCTL_MESON_GEM_SET_DOMAIN, &mgsd);
-	if (ret < 0) {
-		ErrorF("gem_set_domain(CPU) failed: bo %d: %s\n", gsd.handle,
-		       strerror(errno));
-		return ret;
-	}
-
-	return 0;
-}
-
 struct drmmode_interface meson_interface = {
-	"meson",
-	1                     /* use_page_flip_events */,
-	CURSORW               /* cursor width */,
-	CURSORH               /* cursor_height */,
-	CURSORPAD             /* cursor padding */,
-	HWCURSOR_API_STANDARD /* cursor_api */,
-	NULL                  /* init_plane_for_cursor */,
-	0                     /* vblank_query_supported */,
-	create_custom_gem     /* create_custom_gem */,
-	cache_ops_control     /* cache_ops_control */,
-	gem_set_domain        /* gem_set_domain */,
+	"meson"			/* name of drm driver*/,
+	1			/* use_page_flip_events */,
+	CURSORW			/* cursor width */,
+	CURSORH			/* cursor_height */,
+	CURSORPAD		/* cursor padding */,
+	HWCURSOR_API_PLANE	/* cursor_api */,
+	NULL			/* init_plane_for_cursor */,
+	0			/* vblank_query_supported */,
+	create_custom_gem	/* create_custom_gem */,
 };
